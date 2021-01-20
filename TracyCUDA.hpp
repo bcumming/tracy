@@ -31,6 +31,7 @@ using TracyCUDACtx = void*;
 #else
 
 #include <cuda.h>
+#include <cuda_runtime.h>
 
 #include <atomic>
 #include <cassert>
@@ -39,6 +40,7 @@ using TracyCUDACtx = void*;
 #include "client/TracyCallstack.hpp"
 #include "client/TracyProfiler.hpp"
 #include "common/TracyAlloc.hpp"
+#include "common/TracyQueue.hpp"
 
 namespace tracy {
 
@@ -49,16 +51,19 @@ namespace tracy {
 
     class CUDACtx
     {
+    public:
+        static constexpr int maxEvents = 64 * 1024;
+
+    private:
         unsigned int m_contextId;
 
-        cudaEvent_t m_query[maxQueries];
+        cudaEvent_t m_events[maxEvents];
         unsigned int m_head;
         unsigned int m_tail;
 
         synched_stamp m_startTime;
 
     public:
-        constexpr int maxQueries = 64 * 1024;
 
         CUDACtx()
             : m_contextId(GetGpuCtxCounter().fetch_add(1, std::memory_order_relaxed))
@@ -67,8 +72,8 @@ namespace tracy {
         {
             assert(m_contextId != 255);
 
-            for (auto i=0; i<QueryCount; ++i) {
-                assert(CUDA_SUCCESS == cudaEventCreate(m_query+i)); // TODO: free in desctructor
+            for (auto i=0; i<maxEvents; ++i) {
+                assert(CUDA_SUCCESS == cudaEventCreate(m_events+i));
             }
 
             // Set synchronized time stamp
@@ -90,6 +95,14 @@ namespace tracy {
             Profiler::QueueSerialFinish();
         }
 
+        ~CUDACtx()
+        {
+            for (auto i=0; i<maxEvents; ++i)
+            {
+                assert(CUDA_SUCCESS == cudaEventDestroy(m_events[i]));
+            }
+        }
+
         void Collect()
         {
             ZoneScopedC(Color::Red4);
@@ -105,94 +118,75 @@ namespace tracy {
 
             while (m_tail != m_head)
             {
-                auto event = m_query[m_tail];
-                /*
-                cl_event event = eventInfo.event;
-                cl_int eventStatus;
-                cl_int err = clGetEventInfo(event, CL_EVENT_COMMAND_EXECUTION_STATUS, sizeof(cl_int), &eventStatus, nullptr);
-                assert(err == CL_SUCCESS);
-                if (eventStatus != CL_COMPLETE) return;
-
-                cl_int eventInfoQuery = (eventInfo.phase == EventPhase::Begin)
-                    ? CL_PROFILING_COMMAND_START
-                    : CL_PROFILING_COMMAND_END;
-
-                cl_ulong eventTimeStamp = 0;
-                err = clGetEventProfilingInfo(event, eventInfoQuery, sizeof(cl_ulong), &eventTimeStamp, nullptr);
-                assert(err == CL_SUCCESS);
-                assert(eventTimeStamp != 0);
-                */
-
+                uint64_t gpuTime = timeSince(m_events[m_tail]);
                 auto item = Profiler::QueueSerial();
                 MemWrite(&item->hdr.type, QueueType::GpuTime);
-                MemWrite(&item->gpuTime.gpuTime, TimestampOffset(eventTimeStamp));
+                MemWrite(&item->gpuTime.gpuTime, gpuTime);
                 MemWrite(&item->gpuTime.queryId, (uint16_t)m_tail);
                 MemWrite(&item->gpuTime.context, m_contextId);
                 Profiler::QueueSerialFinish();
 
-                m_tail = (m_tail + 1) % QueryCount;
+                m_tail = (m_tail + 1) % maxEvents;
             }
         }
 
-        tracy_force_inline uint8_t GetId() const
-        {
-            return m_contextId;
-        }
-
-        tracy_force_inline unsigned int NextQueryId()
+        tracy_force_inline unsigned int nextQueryId()
         {
             const auto id = m_head;
-            m_head = (m_head + 1) % QueryCount;
-            assert(m_head != m_tail);
-            m_query[id] = eventInfo;
+            m_head = ( m_head + 1 ) % maxEvents;
+            assert( m_head != m_tail );
             return id;
         }
 
-        tracy_force_inline EventInfo& GetQuery(unsigned int id)
+        tracy_force_inline uint8_t contextId() const
         {
-            assert(id < QueryCount);
-            return m_query[id];
+            return m_contextId;
         }
 
     private:
 
         tracy_force_inline void setSynchedBaseTime()
         {
-            // Perform a dummy ping pong copy, which will enqueue two copies in the stream.
+            // Perform a dummy ping pong copy, which will enqueue two copies in
+            // the stream. Then insert a CUDA event after the copies and
+            // synchronize the host and device, to take a cpu timestamp
+            // synchronized with the event.
             int* devPtr;
             cudaMalloc(&devPtr, sizeof(int));
             int value = 42;
             cudaMemcpy(devPtr, &value, sizeof(int), cudaMemcpyHostToDevice);
             cudaMemcpy(&value, devPtr, sizeof(int), cudaMemcpyDeviceToHost);
 
-            // Insert CUDA event after the copies.
-            cudaEventRecord(m_startTime.gpu.event);
+            cudaEventRecord(m_startTime.gpu);
 
-            // Synchronize host and device to at the end of the copies.
             cudaDeviceSynchronize();
 
-            // Take CPU time, which will be synchronized with the CUDA event.
             m_startTime.cpu = Profiler::GetTime();
 
-            cudaFree(dh);
+            cudaFree(devPtr);
+        }
+
+        tracy_force_inline uint64_t timeSince(const cudaEvent_t e)
+        {
+            float time_taken = 0.0f;
+            assert(CUDA_SUCCESS == cudaEventElapsedTime(&time_taken, m_startTime.gpu, e));
+            return m_startTime.cpu + static_cast<uint64_t>(time_taken*1.e6);
         }
     };
 
-    /*
-    class OpenCLCtxScope {
+    class CUDACtxScope {
     public:
-        tracy_force_inline OpenCLCtxScope(OpenCLCtx* ctx, const SourceLocationData* srcLoc, bool is_active)
+        tracy_force_inline CUDACtxScope(CUDACtx* ctx, const SourceLocationData* srcLoc, bool is_active)
 #ifdef TRACY_ON_DEMAND
             : m_active(is_active&& GetProfiler().IsConnected())
 #else
             : m_active(is_active)
 #endif
             , m_ctx(ctx)
-            , m_event(nullptr)
         {
             if (!m_active) return;
 
-            m_beginQueryId = ctx->NextQueryId(EventInfo{ nullptr, EventPhase::Begin });
+            m_beginQueryId = ctx->nextQueryId();
 
             auto item = Profiler::QueueSerial();
             MemWrite(&item->hdr.type, QueueType::GpuZoneBeginSerial);
@@ -200,22 +194,21 @@ namespace tracy {
             MemWrite(&item->gpuZoneBegin.srcloc, (uint64_t)srcLoc);
             MemWrite(&item->gpuZoneBegin.thread, GetThreadHandle());
             MemWrite(&item->gpuZoneBegin.queryId, (uint16_t)m_beginQueryId);
-            MemWrite(&item->gpuZoneBegin.context, ctx->GetId());
+            MemWrite(&item->gpuZoneBegin.context, ctx->contextId());
             Profiler::QueueSerialFinish();
         }
 
-        tracy_force_inline OpenCLCtxScope(OpenCLCtx* ctx, const SourceLocationData* srcLoc, int depth, bool is_active)
+        tracy_force_inline CUDACtxScope(CUDACtx* ctx, const SourceLocationData* srcLoc, int depth, bool is_active)
 #ifdef TRACY_ON_DEMAND
             : m_active(is_active&& GetProfiler().IsConnected())
 #else
             : m_active(is_active)
 #endif
             , m_ctx(ctx)
-            , m_event(nullptr)
         {
             if (!m_active) return;
 
-            m_beginQueryId = ctx->NextQueryId(EventInfo{ nullptr, EventPhase::Begin });
+            m_beginQueryId = ctx->nextQueryId();
 
             GetProfiler().SendCallstack(depth);
 
@@ -225,50 +218,41 @@ namespace tracy {
             MemWrite(&item->gpuZoneBegin.srcloc, (uint64_t)srcLoc);
             MemWrite(&item->gpuZoneBegin.thread, GetThreadHandle());
             MemWrite(&item->gpuZoneBegin.queryId, (uint16_t)m_beginQueryId);
-            MemWrite(&item->gpuZoneBegin.context, ctx->GetId());
+            MemWrite(&item->gpuZoneBegin.context, ctx->contextId());
             Profiler::QueueSerialFinish();
         }
 
-        tracy_force_inline void SetEvent(cl_event event)
+        tracy_force_inline ~CUDACtxScope()
         {
-            m_event = event;
-            assert(clRetainEvent(m_event) == CL_SUCCESS);
-            m_ctx->GetQuery(m_beginQueryId).event = m_event;
-        }
-
-        tracy_force_inline ~OpenCLCtxScope()
-        {
-            const auto queryId = m_ctx->NextQueryId(EventInfo{ m_event, EventPhase::End });
+            const auto queryId = m_ctx->nextQueryId();
 
             auto item = Profiler::QueueSerial();
             MemWrite(&item->hdr.type, QueueType::GpuZoneEndSerial);
             MemWrite(&item->gpuZoneEnd.cpuTime, Profiler::GetTime());
             MemWrite(&item->gpuZoneEnd.thread, GetThreadHandle());
             MemWrite(&item->gpuZoneEnd.queryId, (uint16_t)queryId);
-            MemWrite(&item->gpuZoneEnd.context, m_ctx->GetId());
+            MemWrite(&item->gpuZoneEnd.context, m_ctx->contextId());
             Profiler::QueueSerialFinish();
         }
 
         const bool m_active;
-        OpenCLCtx* m_ctx;
-        cl_event m_event;
+        CUDACtx* m_ctx;
         unsigned int m_beginQueryId;
     };
 
-    static inline OpenCLCtx* CreateCLContext(cl_context context, cl_device_id device)
+    static inline CUDACtx* CreateCUDAContext() // TODO: make this consume cuda context/cuda stream/device? and forward it.
     {
         InitRPMallocThread();
-        auto ctx = (OpenCLCtx*)tracy_malloc(sizeof(OpenCLCtx));
-        new (ctx) OpenCLCtx(context, device);
+        auto ctx = (CUDACtx*)tracy_malloc(sizeof(CUDACtx));
+        new (ctx) CUDACtx();
         return ctx;
     }
 
-    static inline void DestroyCLContext(OpenCLCtx* ctx)
+    static inline void DestroyCUDAContext(CUDACtx* ctx)
     {
-        ctx->~OpenCLCtx();
+        ctx->~CUDACtx();
         tracy_free(ctx);
     }
-    */
 
 }  // namespace tracy
 
