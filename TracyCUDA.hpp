@@ -35,6 +35,7 @@ using TracyCUDACtx = void*;
 
 #include <atomic>
 #include <cassert>
+#include <iostream>
 
 #include "Tracy.hpp"
 #include "client/TracyCallstack.hpp"
@@ -44,9 +45,21 @@ using TracyCUDACtx = void*;
 
 namespace tracy {
 
+    static inline void test_cuda_call(cudaError_t status) {
+        if (cudaSuccess != status) {
+            std::cout << "CUDA:: Error " << cudaGetErrorName(status) << " : " << cudaGetErrorString(status) << "\n";
+        }
+    }
+
     struct synched_stamp {
         uint64_t cpu;
         cudaEvent_t gpu;
+        synched_stamp() {
+            test_cuda_call(cudaEventCreate(&gpu));
+        }
+        ~synched_stamp() {
+            test_cuda_call(cudaEventDestroy(gpu));
+        }
     };
 
     class CUDACtx
@@ -55,7 +68,7 @@ namespace tracy {
         static constexpr int maxEvents = 64 * 1024;
 
     private:
-        unsigned int m_contextId;
+        unsigned int m_context;
 
         cudaEvent_t m_events[maxEvents];
         unsigned int m_head;
@@ -66,14 +79,15 @@ namespace tracy {
     public:
 
         CUDACtx()
-            : m_contextId(GetGpuCtxCounter().fetch_add(1, std::memory_order_relaxed))
+            : m_context(GetGpuCtxCounter().fetch_add(1, std::memory_order_relaxed))
             , m_head(0)
             , m_tail(0)
         {
-            assert(m_contextId != 255);
+            //std::cout << "TRACY:: create context with id " << m_context << "\n";
+            assert(m_context != 255);
 
             for (auto i=0; i<maxEvents; ++i) {
-                assert(CUDA_SUCCESS == cudaEventCreate(m_events+i));
+                test_cuda_call(cudaEventCreate(m_events+i));
             }
 
             // Set synchronized time stamp
@@ -87,7 +101,7 @@ namespace tracy {
             memset(&item->gpuNewContext.thread, 0, sizeof(item->gpuNewContext.thread));
             MemWrite(&item->gpuNewContext.period, 1.0f);
             MemWrite(&item->gpuNewContext.type, GpuContextType::CUDA);
-            MemWrite(&item->gpuNewContext.context, (uint8_t) m_contextId);
+            MemWrite(&item->gpuNewContext.context, (uint8_t) m_context);
             MemWrite(&item->gpuNewContext.flags, (uint8_t)0);
 #ifdef TRACY_ON_DEMAND
             GetProfiler().DeferItem(*item);
@@ -99,13 +113,14 @@ namespace tracy {
         {
             for (auto i=0; i<maxEvents; ++i)
             {
-                assert(CUDA_SUCCESS == cudaEventDestroy(m_events[i]));
+                test_cuda_call(cudaEventDestroy(m_events[i]));
             }
         }
 
         void Collect()
         {
             ZoneScopedC(Color::Red4);
+            cudaDeviceSynchronize();
 
             if (m_tail == m_head) return;
 
@@ -118,12 +133,12 @@ namespace tracy {
 
             while (m_tail != m_head)
             {
-                uint64_t gpuTime = timeSince(m_events[m_tail]);
+                uint64_t gpuTime = timeSince(m_tail);
                 auto item = Profiler::QueueSerial();
                 MemWrite(&item->hdr.type, QueueType::GpuTime);
                 MemWrite(&item->gpuTime.gpuTime, gpuTime);
                 MemWrite(&item->gpuTime.queryId, (uint16_t)m_tail);
-                MemWrite(&item->gpuTime.context, m_contextId);
+                MemWrite(&item->gpuTime.context, m_context);
                 Profiler::QueueSerialFinish();
 
                 m_tail = (m_tail + 1) % maxEvents;
@@ -135,12 +150,15 @@ namespace tracy {
             const auto id = m_head;
             m_head = ( m_head + 1 ) % maxEvents;
             assert( m_head != m_tail );
+
+            test_cuda_call(cudaEventRecord(m_events[id], 0));
+            //std::cout << "TRACY::          event " << id << " add\n";
             return id;
         }
 
-        tracy_force_inline uint8_t contextId() const
+        tracy_force_inline uint8_t context() const
         {
-            return m_contextId;
+            return m_context;
         }
 
     private:
@@ -157,20 +175,24 @@ namespace tracy {
             cudaMemcpy(devPtr, &value, sizeof(int), cudaMemcpyHostToDevice);
             cudaMemcpy(&value, devPtr, sizeof(int), cudaMemcpyDeviceToHost);
 
-            cudaEventRecord(m_startTime.gpu);
+            //std::cout << "TRACY: Synchronizing GPU clock\n";
+            test_cuda_call(cudaEventRecord(m_startTime.gpu));
 
             cudaDeviceSynchronize();
 
             m_startTime.cpu = Profiler::GetTime();
+            //std::cout << "TRACY: Synchronized at " << m_startTime.cpu << "\n";
 
             cudaFree(devPtr);
         }
 
-        tracy_force_inline uint64_t timeSince(const cudaEvent_t e)
+        tracy_force_inline uint64_t timeSince(int id)
         {
             float time_taken = 0.0f;
-            assert(CUDA_SUCCESS == cudaEventElapsedTime(&time_taken, m_startTime.gpu, e));
-            return m_startTime.cpu + static_cast<uint64_t>(time_taken*1.e6);
+            test_cuda_call(cudaEventElapsedTime(&time_taken, m_startTime.gpu, m_events[id]));
+            uint64_t tabs_ns = m_startTime.cpu + static_cast<uint64_t>(time_taken*1.e6);
+            //std::cout << "TRACY::          event " << id << " time " << time_taken << "ms == " << tabs_ns << "\n";
+            return tabs_ns;
         }
     };
 
@@ -187,6 +209,7 @@ namespace tracy {
             if (!m_active) return;
 
             m_beginQueryId = ctx->nextQueryId();
+            //std::cout << "TRACY:: create scope scope id " << m_beginQueryId << "\n";
 
             auto item = Profiler::QueueSerial();
             MemWrite(&item->hdr.type, QueueType::GpuZoneBeginSerial);
@@ -194,7 +217,7 @@ namespace tracy {
             MemWrite(&item->gpuZoneBegin.srcloc, (uint64_t)srcLoc);
             MemWrite(&item->gpuZoneBegin.thread, GetThreadHandle());
             MemWrite(&item->gpuZoneBegin.queryId, (uint16_t)m_beginQueryId);
-            MemWrite(&item->gpuZoneBegin.context, ctx->contextId());
+            MemWrite(&item->gpuZoneBegin.context, ctx->context());
             Profiler::QueueSerialFinish();
         }
 
@@ -218,20 +241,21 @@ namespace tracy {
             MemWrite(&item->gpuZoneBegin.srcloc, (uint64_t)srcLoc);
             MemWrite(&item->gpuZoneBegin.thread, GetThreadHandle());
             MemWrite(&item->gpuZoneBegin.queryId, (uint16_t)m_beginQueryId);
-            MemWrite(&item->gpuZoneBegin.context, ctx->contextId());
+            MemWrite(&item->gpuZoneBegin.context, ctx->context());
             Profiler::QueueSerialFinish();
         }
 
         tracy_force_inline ~CUDACtxScope()
         {
             const auto queryId = m_ctx->nextQueryId();
+            //std::cout << "TRACY:: close scope scope id " << queryId << "\n";
 
             auto item = Profiler::QueueSerial();
             MemWrite(&item->hdr.type, QueueType::GpuZoneEndSerial);
             MemWrite(&item->gpuZoneEnd.cpuTime, Profiler::GetTime());
             MemWrite(&item->gpuZoneEnd.thread, GetThreadHandle());
             MemWrite(&item->gpuZoneEnd.queryId, (uint16_t)queryId);
-            MemWrite(&item->gpuZoneEnd.context, m_ctx->contextId());
+            MemWrite(&item->gpuZoneEnd.context, m_ctx->context());
             Profiler::QueueSerialFinish();
         }
 
@@ -242,6 +266,7 @@ namespace tracy {
 
     static inline CUDACtx* CreateCUDAContext() // TODO: make this consume cuda context/cuda stream/device? and forward it.
     {
+        std::cout << "TRACY:: create context\n";
         InitRPMallocThread();
         auto ctx = (CUDACtx*)tracy_malloc(sizeof(CUDACtx));
         new (ctx) CUDACtx();
@@ -250,6 +275,7 @@ namespace tracy {
 
     static inline void DestroyCUDAContext(CUDACtx* ctx)
     {
+        std::cout << "TRACY:: destroy context\n";
         ctx->~CUDACtx();
         tracy_free(ctx);
     }
@@ -257,38 +283,38 @@ namespace tracy {
 }  // namespace tracy
 
 /*
-using TracyCLCtx = tracy::OpenCLCtx*;
+using TracyCUDACtx = tracy::OpenCUDACtx*;
 
-#define TracyCLContext(context, device) tracy::CreateCLContext(context, device);
-#define TracyCLDestroy(ctx) tracy::DestroyCLContext(ctx);
+#define TracyCUDAContext(context, device) tracy::CreateCUDAContext();
+#define TracyCUDADestroy(ctx) tracy::DestroyCUDAContext(ctx);
 #if defined TRACY_HAS_CALLSTACK && defined TRACY_CALLSTACK
-#  define TracyCLNamedZone(ctx, varname, name, active) static constexpr tracy::SourceLocationData TracyConcat(__tracy_gpu_source_location,__LINE__) { name, __FUNCTION__, __FILE__, (uint32_t)__LINE__, 0 }; tracy::OpenCLCtxScope varname(ctx, &TracyConcat(__tracy_gpu_source_location,__LINE__), TRACY_CALLSTACK, active );
-#  define TracyCLNamedZoneC(ctx, varname, name, color, active) static constexpr tracy::SourceLocationData TracyConcat(__tracy_gpu_source_location,__LINE__) { name, __FUNCTION__, __FILE__, (uint32_t)__LINE__, color }; tracy::OpenCLCtxScope varname(ctx, &TracyConcat(__tracy_gpu_source_location,__LINE__), TRACY_CALLSTACK, active );
-#  define TracyCLZone(ctx, name) TracyCLNamedZoneS(ctx, __tracy_gpu_zone, name, TRACY_CALLSTACK, true)
-#  define TracyCLZoneC(ctx, name, color) TracyCLNamedZoneCS(ctx, __tracy_gpu_zone, name, color, TRACY_CALLSTACK, true)
+#  define TracyCUDANamedZone(ctx, varname, name, active) static constexpr tracy::SourceLocationData TracyConcat(__tracy_gpu_source_location,__LINE__) { name, __FUNCTION__, __FILE__, (uint32_t)__LINE__, 0 }; tracy::OpenCUDACtxScope varname(ctx, &TracyConcat(__tracy_gpu_source_location,__LINE__), TRACY_CALLSTACK, active );
+#  define TracyCUDANamedZoneC(ctx, varname, name, color, active) static constexpr tracy::SourceLocationData TracyConcat(__tracy_gpu_source_location,__LINE__) { name, __FUNCTION__, __FILE__, (uint32_t)__LINE__, color }; tracy::OpenCUDACtxScope varname(ctx, &TracyConcat(__tracy_gpu_source_location,__LINE__), TRACY_CALLSTACK, active );
+#  define TracyCUDAZone(ctx, name) TracyCUDANamedZoneS(ctx, __tracy_gpu_zone, name, TRACY_CALLSTACK, true)
+#  define TracyCUDAZoneC(ctx, name, color) TracyCUDANamedZoneCS(ctx, __tracy_gpu_zone, name, color, TRACY_CALLSTACK, true)
 #else
-#  define TracyCLNamedZone(ctx, varname, name, active) static constexpr tracy::SourceLocationData TracyConcat(__tracy_gpu_source_location,__LINE__){ name, __FUNCTION__, __FILE__, (uint32_t)__LINE__, 0 }; tracy::OpenCLCtxScope varname(ctx, &TracyConcat(__tracy_gpu_source_location,__LINE__), active);
-#  define TracyCLNamedZoneC(ctx, varname, name, color, active) static constexpr tracy::SourceLocationData TracyConcat(__tracy_gpu_source_location,__LINE__){ name, __FUNCTION__, __FILE__, (uint32_t)__LINE__, color }; tracy::OpenCLCtxScope varname(ctx, &TracyConcat(__tracy_gpu_source_location,__LINE__), active);
-#  define TracyCLZone(ctx, name) TracyCLNamedZone(ctx, __tracy_gpu_zone, name, true)
-#  define TracyCLZoneC(ctx, name, color) TracyCLNamedZoneC(ctx, __tracy_gpu_zone, name, color, true )
+#  define TracyCUDANamedZone(ctx, varname, name, active) static constexpr tracy::SourceLocationData TracyConcat(__tracy_gpu_source_location,__LINE__){ name, __FUNCTION__, __FILE__, (uint32_t)__LINE__, 0 }; tracy::OpenCUDACtxScope varname(ctx, &TracyConcat(__tracy_gpu_source_location,__LINE__), active);
+#  define TracyCUDANamedZoneC(ctx, varname, name, color, active) static constexpr tracy::SourceLocationData TracyConcat(__tracy_gpu_source_location,__LINE__){ name, __FUNCTION__, __FILE__, (uint32_t)__LINE__, color }; tracy::OpenCUDACtxScope varname(ctx, &TracyConcat(__tracy_gpu_source_location,__LINE__), active);
+#  define TracyCUDAZone(ctx, name) TracyCUDANamedZone(ctx, __tracy_gpu_zone, name, true)
+#  define TracyCUDAZoneC(ctx, name, color) TracyCUDANamedZoneC(ctx, __tracy_gpu_zone, name, color, true )
 #endif
 
 #ifdef TRACY_HAS_CALLSTACK
-#  define TracyCLNamedZoneS(ctx, varname, name, depth, active) static constexpr tracy::SourceLocationData TracyConcat(__tracy_gpu_source_location,__LINE__){ name, __FUNCTION__, __FILE__, (uint32_t)__LINE__, 0 }; tracy::OpenCLCtxScope varname(ctx, &TracyConcat(__tracy_gpu_source_location,__LINE__), depth, active);
-#  define TracyCLNamedZoneCS(ctx, varname, name, color, depth, active) static constexpr tracy::SourceLocationData TracyConcat(__tracy_gpu_source_location,__LINE__){ name, __FUNCTION__, __FILE__, (uint32_t)__LINE__, color }; tracy::OpenCLCtxScope varname(ctx, &TracyConcat(__tracy_gpu_source_location,__LINE__), depth, active);
-#  define TracyCLZoneS(ctx, name, depth) TracyCLNamedZoneS(ctx, __tracy_gpu_zone, name, depth, true)
-#  define TracyCLZoneCS(ctx, name, color, depth) TracyCLNamedZoneCS(ctx, __tracy_gpu_zone, name, color, depth, true)
+#  define TracyCUDANamedZoneS(ctx, varname, name, depth, active) static constexpr tracy::SourceLocationData TracyConcat(__tracy_gpu_source_location,__LINE__){ name, __FUNCTION__, __FILE__, (uint32_t)__LINE__, 0 }; tracy::OpenCUDACtxScope varname(ctx, &TracyConcat(__tracy_gpu_source_location,__LINE__), depth, active);
+#  define TracyCUDANamedZoneCS(ctx, varname, name, color, depth, active) static constexpr tracy::SourceLocationData TracyConcat(__tracy_gpu_source_location,__LINE__){ name, __FUNCTION__, __FILE__, (uint32_t)__LINE__, color }; tracy::OpenCUDACtxScope varname(ctx, &TracyConcat(__tracy_gpu_source_location,__LINE__), depth, active);
+#  define TracyCUDAZoneS(ctx, name, depth) TracyCUDANamedZoneS(ctx, __tracy_gpu_zone, name, depth, true)
+#  define TracyCUDAZoneCS(ctx, name, color, depth) TracyCUDANamedZoneCS(ctx, __tracy_gpu_zone, name, color, depth, true)
 #else
-#  define TracyCLNamedZoneS(ctx, varname, name, depth, active) TracyCLNamedZone(ctx, varname, name, active)
-#  define TracyCLNamedZoneCS(ctx, varname, name, color, depth, active) TracyCLNamedZoneC(ctx, varname, name, color, active)
-#  define TracyCLZoneS(ctx, name, depth) TracyCLZone(ctx, name)
-#  define TracyCLZoneCS(ctx, name, color, depth) TracyCLZoneC(ctx, name, color)
+#  define TracyCUDANamedZoneS(ctx, varname, name, depth, active) TracyCUDANamedZone(ctx, varname, name, active)
+#  define TracyCUDANamedZoneCS(ctx, varname, name, color, depth, active) TracyCUDANamedZoneC(ctx, varname, name, color, active)
+#  define TracyCUDAZoneS(ctx, name, depth) TracyCUDAZone(ctx, name)
+#  define TracyCUDAZoneCS(ctx, name, color, depth) TracyCUDAZoneC(ctx, name, color)
 #endif
 
-#define TracyCLNamedZoneSetEvent(varname, event) varname.SetEvent(event)
-#define TracyCLZoneSetEvent(event) __tracy_gpu_zone.SetEvent(event)
+#define TracyCUDANamedZoneSetEvent(varname, event) varname.SetEvent(event)
+#define TracyCUDAZoneSetEvent(event) __tracy_gpu_zone.SetEvent(event)
 
-#define TracyCLCollect(ctx) ctx->Collect()
+#define TracyCUDACollect(ctx) ctx->Collect()
 */
 
 #endif
